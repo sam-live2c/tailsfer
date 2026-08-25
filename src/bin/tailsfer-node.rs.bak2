@@ -1,0 +1,396 @@
+use std::io::{self, Write};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use quinn::{Endpoint, RecvStream, SendStream, ServerConfig};
+use rustls::crypto::ring;
+
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
+
+use tailsfer_core::transfer::decision::{TransferDecision, verified_frame};
+use tailsfer_core::transfer::offer::TransferOffer;
+use tailsfer_core::transport::protocol::{ALPN, Frame};
+
+const TAILSFER_PORT: u16 = 47691;
+const BUFFER_SIZE: usize = 1024 * 1024;
+const MAX_FRAME_SIZE: usize = 1024 * 1024 + 4096;
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn safe_filename(name: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let path = Path::new(name);
+
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("invalid filename")?;
+
+    if filename.is_empty() {
+        return Err("empty filename".into());
+    }
+
+    if filename == "." || filename == ".." {
+        return Err("invalid filename".into());
+    }
+
+    if filename.contains('\0') {
+        return Err("filename contains NUL byte".into());
+    }
+
+    Ok(filename.to_string())
+}
+
+fn transfer_id_hex(id: &[u8; 16]) -> String {
+    id.iter().map(|byte| format!("{:02x}", byte)).collect()
+}
+
+async fn read_offer(
+    recv: &mut RecvStream,
+) -> Result<TransferOffer, Box<dyn std::error::Error + Send + Sync>> {
+    let mut header = [0u8; 5];
+
+    recv.read_exact(&mut header).await?;
+
+    let payload_len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+
+    if payload_len > MAX_FRAME_SIZE {
+        return Err("offer frame too large".into());
+    }
+
+    let mut payload = vec![0u8; payload_len];
+
+    recv.read_exact(&mut payload).await?;
+
+    let mut frame_bytes = Vec::with_capacity(5 + payload_len);
+
+    frame_bytes.extend_from_slice(&header);
+    frame_bytes.extend_from_slice(&payload);
+
+    let frame = Frame::decode(&frame_bytes)?;
+
+    TransferOffer::from_frame(&frame).map_err(|e| e.into())
+}
+
+async fn send_decision(
+    send: &mut SendStream,
+    decision: TransferDecision,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let frame = decision.to_frame(match &decision {
+        TransferDecision::Accept => {
+            return Err("decision requires transfer ID".into());
+        }
+        TransferDecision::Reject => {
+            return Err("decision requires transfer ID".into());
+        }
+    });
+
+    let _ = frame;
+
+    Ok(())
+}
+
+async fn receive_file(
+    mut recv: RecvStream,
+    offer: TransferOffer,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    let receiver_dir =
+        PathBuf::from(std::env::var("TAILSFER_RECEIVER_DIR").unwrap_or_else(|_| ".".to_string()));
+
+    tokio::fs::create_dir_all(&receiver_dir).await?;
+
+    let filename = safe_filename(&offer.file_name)?;
+
+    let output_path = receiver_dir.join(&filename);
+
+    if tokio::fs::try_exists(&output_path).await? {
+        return Err(format!("destination already exists: {}", output_path.display()).into());
+    }
+
+    let transfer_id = transfer_id_hex(&offer.transfer_id);
+
+    let temp_name = format!(".{}.{}.tailsfer.part", filename, transfer_id);
+
+    let temp_path = receiver_dir.join(temp_name);
+
+    let mut file = File::create(&temp_path).await?;
+
+    let result = timeout(TRANSFER_TIMEOUT, async {
+        let mut buffer = vec![0u8; BUFFER_SIZE];
+        let mut total = 0u64;
+        let mut hasher = blake3::Hasher::new();
+
+        loop {
+            match recv.read(&mut buffer).await? {
+                Some(n) if n > 0 => {
+                    file.write_all(&buffer[..n]).await?;
+                    hasher.update(&buffer[..n]);
+
+                    total += n as u64;
+
+                    let received_mib = total as f64 / 1_048_576.0;
+
+                    let expected_mib = offer.file_size as f64 / 1_048_576.0;
+
+                    let percentage = if offer.file_size == 0 {
+                        100.0
+                    } else {
+                        (total as f64 / offer.file_size as f64) * 100.0
+                    };
+
+                    println!(
+                        "Received: {:.2} / {:.2} MiB ({:.1}%)",
+                        received_mib, expected_mib, percentage
+                    );
+
+                    if total > offer.file_size {
+                        return Err(format!(
+                            "received more data than expected: {} > {}",
+                            total, offer.file_size
+                        )
+                        .into());
+                    }
+                }
+
+                Some(_) => {
+                    break;
+                }
+
+                None => {
+                    break;
+                }
+            }
+        }
+
+        file.flush().await?;
+
+        let hash = *hasher.finalize().as_bytes();
+
+        Ok::<(u64, [u8; 32]), Box<dyn std::error::Error + Send + Sync>>((total, hash))
+    })
+    .await;
+
+    let (total, hash) = match result {
+        Ok(Ok(result)) => result,
+
+        Ok(Err(error)) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(error);
+        }
+
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+
+            return Err(format!(
+                "transfer timed out after {} seconds",
+                TRANSFER_TIMEOUT.as_secs()
+            )
+            .into());
+        }
+    };
+
+    if total != offer.file_size {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+
+        return Err(format!(
+            "transfer size mismatch: expected {}, received {}",
+            offer.file_size, total
+        )
+        .into());
+    }
+
+    tokio::fs::rename(&temp_path, &output_path).await?;
+
+    println!();
+    println!("======================================");
+    println!("       TRANSFER COMPLETE");
+    println!("======================================");
+    println!("File : {}", filename);
+    println!("Size : {} bytes", total);
+    println!("Saved: {}", output_path.display());
+    println!("======================================");
+
+    Ok((total, hash))
+}
+
+async fn handle_connection(
+    connection: quinn::Connection,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (mut send, mut recv) = connection.accept_bi().await?;
+
+    let offer = read_offer(&mut recv).await?;
+
+    let filename = safe_filename(&offer.file_name)?;
+
+    println!();
+    println!("======================================");
+    println!("         INCOMING TAILSFER");
+    println!("======================================");
+    println!("File : {}", filename);
+    println!("Size : {} bytes", offer.file_size);
+    println!("Type : {}", offer.mime_type);
+    println!("From : {}", connection.remote_address());
+    println!("======================================");
+    println!();
+
+    println!("Accept this file?");
+    println!("The file will NOT be saved unless you accept.");
+    println!();
+
+    print!("Accept [y/N]: ");
+    io::stdout().flush()?;
+
+    let mut answer = String::new();
+
+    io::stdin().read_line(&mut answer)?;
+
+    let accepted = answer.trim().eq_ignore_ascii_case("y");
+
+    let decision = if accepted {
+        TransferDecision::Accept
+    } else {
+        TransferDecision::Reject
+    };
+
+    let decision_frame = decision.to_frame(offer.transfer_id)?;
+
+    let encoded = decision_frame.encode()?;
+
+    send.write_all(&encoded).await?;
+
+    if !accepted {
+        println!("Rejected.");
+
+        send.finish()?;
+
+        connection.close(0u32.into(), b"rejected");
+
+        return Ok(());
+    }
+
+    println!();
+    println!("Accepted. Receiving {}...", filename);
+
+    /*
+     * Receive the file bytes.
+     *
+     * The sender calls finish() after writing the final byte,
+     * so receive_file() returns after the sender's send side
+     * reaches EOF.
+     */
+    let result = receive_file(recv, offer.clone()).await;
+
+    match result {
+        Ok((total, hash)) => {
+            /*
+             * The file has been completely received and hashed.
+             *
+             * Send a dedicated VERIFIED frame rather than
+             * reusing ACCEPT as a verification message.
+             */
+            let verification = verified_frame(offer.transfer_id)?;
+
+            let encoded = verification.encode()?;
+
+            send.write_all(&encoded).await?;
+
+            send.finish()?;
+
+            println!();
+            println!("Verification sent to sender: {} bytes", total);
+            println!(
+                "BLAKE3: {}",
+                hash.iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>()
+            );
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            connection.close(0u32.into(), b"done");
+        }
+
+        Err(error) => {
+            eprintln!("Transfer error: {}", error);
+
+            /*
+             * Inform the sender that verification failed.
+             */
+            let failure = TransferDecision::Reject.to_frame(offer.transfer_id)?;
+
+            let encoded = failure.encode()?;
+
+            let _ = send.write_all(&encoded).await;
+
+            let _ = send.finish();
+
+            connection.close(1u32.into(), b"transfer failed");
+
+            return Err(error);
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
+    println!("==============================");
+    println!("        TAILSFER NODE");
+    println!("==============================");
+
+    let cert = rcgen::generate_simple_self_signed(vec!["tailsfer.local".to_string()])?;
+
+    let cert_der = cert.cert.der().clone();
+
+    let key_der = cert.signing_key.serialize_der();
+
+    let mut tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![quinn::rustls::pki_types::CertificateDer::from(cert_der)],
+            quinn::rustls::pki_types::PrivateKeyDer::try_from(key_der)?,
+        )?;
+
+    tls_config.alpn_protocols = vec![ALPN.to_vec()];
+
+    let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)?;
+
+    let server_config = ServerConfig::with_crypto(Arc::new(quic_config));
+
+    let addr: SocketAddr = format!("0.0.0.0:{}", TAILSFER_PORT).parse()?;
+
+    let endpoint = Endpoint::server(server_config, addr)?;
+
+    println!("Tailsfer QUIC listening on 0.0.0.0:{}", TAILSFER_PORT);
+
+    println!("Local node ready for LAN transfers.");
+
+    println!();
+
+    while let Some(connecting) = endpoint.accept().await {
+        tokio::spawn(async move {
+            match connecting.await {
+                Ok(connection) => {
+                    println!("\nConnection from {}", connection.remote_address());
+
+                    if let Err(error) = handle_connection(connection).await {
+                        eprintln!("Transfer error: {}", error);
+                    }
+                }
+
+                Err(error) => {
+                    eprintln!("QUIC connection error: {}", error);
+                }
+            }
+        });
+    }
+
+    Ok(())
+}

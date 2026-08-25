@@ -1,0 +1,6 @@
+target/
+*.bak
+*.part
+*.tar.gz
+.env
+.env.*
