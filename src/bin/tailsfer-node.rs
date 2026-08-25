@@ -4,13 +4,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use quinn::{Endpoint, RecvStream, SendStream, ServerConfig};
+use quinn::{Endpoint, RecvStream, ServerConfig};
 use rustls::crypto::ring;
 
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
+use tailsfer_core::identity::DeviceIdentity;
+use tailsfer_core::identity::default_identity_path;
 use tailsfer_core::transfer::decision::{TransferDecision, verified_frame};
 use tailsfer_core::transfer::offer::TransferOffer;
 use tailsfer_core::transport::protocol::{ALPN, Frame};
@@ -19,6 +21,47 @@ const TAILSFER_PORT: u16 = 47691;
 const BUFFER_SIZE: usize = 1024 * 1024;
 const MAX_FRAME_SIZE: usize = 1024 * 1024 + 4096;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceivePolicy {
+    Manual,
+    Auto,
+}
+
+impl ReceivePolicy {
+    fn from_env() -> Self {
+        match std::env::var("TAILSFER_RECEIVE_POLICY")
+            .unwrap_or_else(|_| "manual".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "auto" => Self::Auto,
+            _ => Self::Manual,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+fn load_device_identity() -> Result<DeviceIdentity, Box<dyn std::error::Error>> {
+    let path = default_identity_path();
+
+    let identity = DeviceIdentity::load_or_create(&path)?;
+
+    println!("======================================");
+    println!("          TAILSFER DEVICE");
+    println!("======================================");
+    println!("Identity : {}", path.display());
+    println!("Device ID: {}", identity.device_id_hex());
+    println!("======================================");
+
+    Ok(identity)
+}
 
 fn safe_filename(name: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let path = Path::new(name);
@@ -45,6 +88,10 @@ fn safe_filename(name: &str) -> Result<String, Box<dyn std::error::Error + Send 
 
 fn transfer_id_hex(id: &[u8; 16]) -> String {
     id.iter().map(|byte| format!("{:02x}", byte)).collect()
+}
+
+fn hash_hex(hash: &[u8; 32]) -> String {
+    hash.iter().map(|byte| format!("{:02x}", byte)).collect()
 }
 
 async fn read_offer(
@@ -108,24 +155,10 @@ async fn receive_file(
             match recv.read(&mut buffer).await? {
                 Some(n) if n > 0 => {
                     file.write_all(&buffer[..n]).await?;
+
                     hasher.update(&buffer[..n]);
 
                     total += n as u64;
-
-                    let received_mib = total as f64 / 1_048_576.0;
-
-                    let expected_mib = offer.file_size as f64 / 1_048_576.0;
-
-                    let percentage = if offer.file_size == 0 {
-                        100.0
-                    } else {
-                        (total as f64 / offer.file_size as f64) * 100.0
-                    };
-
-                    println!(
-                        "Received: {:.2} / {:.2} MiB ({:.1}%)",
-                        received_mib, expected_mib, percentage
-                    );
 
                     if total > offer.file_size {
                         return Err(format!(
@@ -192,6 +225,7 @@ async fn receive_file(
     println!("File : {}", filename);
     println!("Size : {} bytes", total);
     println!("Saved: {}", output_path.display());
+    println!("BLAKE3: {}", hash_hex(&hash));
     println!("======================================");
 
     Ok((total, hash))
@@ -199,6 +233,7 @@ async fn receive_file(
 
 async fn handle_connection(
     connection: quinn::Connection,
+    receive_policy: ReceivePolicy,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut send, mut recv) = connection.accept_bi().await?;
 
@@ -217,18 +252,28 @@ async fn handle_connection(
     println!("======================================");
     println!();
 
-    println!("Accept this file?");
-    println!("The file will NOT be saved unless you accept.");
-    println!();
+    let accepted = match receive_policy {
+        ReceivePolicy::Auto => {
+            println!("Receive policy: AUTO");
+            println!("Automatically accepting transfer.");
+            true
+        }
 
-    print!("Accept [y/N]: ");
-    io::stdout().flush()?;
+        ReceivePolicy::Manual => {
+            println!("Receive policy: MANUAL");
+            println!("The file will NOT be saved unless you accept.");
+            println!();
 
-    let mut answer = String::new();
+            print!("Accept [y/N]: ");
+            io::stdout().flush()?;
 
-    io::stdin().read_line(&mut answer)?;
+            let mut answer = String::new();
 
-    let accepted = answer.trim().eq_ignore_ascii_case("y");
+            io::stdin().read_line(&mut answer)?;
+
+            answer.trim().eq_ignore_ascii_case("y")
+        }
+    };
 
     let decision = if accepted {
         TransferDecision::Accept
@@ -255,24 +300,19 @@ async fn handle_connection(
     println!();
     println!("Accepted. Receiving {}...", filename);
 
-    /*
-     * Receive the file bytes.
-     *
-     * The sender calls finish() after writing the final byte,
-     * so receive_file() returns after the sender's send side
-     * reaches EOF.
-     */
     let result = receive_file(recv, offer.clone()).await;
 
     match result {
         Ok((total, hash)) => {
             /*
-             * The file has been completely received and hashed.
+             * VERIFIED now contains:
              *
-             * Send a dedicated VERIFIED frame rather than
-             * reusing ACCEPT as a verification message.
+             * transfer_id + receiver BLAKE3 hash
+             *
+             * The sender can compare this hash with its own
+             * sender-side digest.
              */
-            let verification = verified_frame(offer.transfer_id)?;
+            let verification = verified_frame(offer.transfer_id, hash)?;
 
             let encoded = verification.encode()?;
 
@@ -282,12 +322,7 @@ async fn handle_connection(
 
             println!();
             println!("Verification sent to sender: {} bytes", total);
-            println!(
-                "BLAKE3: {}",
-                hash.iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<String>()
-            );
+            println!("Receiver BLAKE3: {}", hash_hex(&hash));
 
             tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -297,9 +332,6 @@ async fn handle_connection(
         Err(error) => {
             eprintln!("Transfer error: {}", error);
 
-            /*
-             * Inform the sender that verification failed.
-             */
             let failure = TransferDecision::Reject.to_frame(offer.transfer_id)?;
 
             let encoded = failure.encode()?;
@@ -326,6 +358,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("==============================");
     println!("        TAILSFER NODE");
     println!("==============================");
+
+    let identity = load_device_identity()?;
+
+    let receive_policy = ReceivePolicy::from_env();
+
+    println!("Receive policy: {}", receive_policy.name());
+
+    println!("Device ID: {}", identity.device_id_hex());
+
+    println!();
 
     let cert = rcgen::generate_simple_self_signed(vec!["tailsfer.local".to_string()])?;
 
@@ -357,12 +399,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     while let Some(connecting) = endpoint.accept().await {
+        let policy = receive_policy;
+
         tokio::spawn(async move {
             match connecting.await {
                 Ok(connection) => {
                     println!("\nConnection from {}", connection.remote_address());
 
-                    if let Err(error) = handle_connection(connection).await {
+                    if let Err(error) = handle_connection(connection, policy).await {
                         eprintln!("Transfer error: {}", error);
                     }
                 }

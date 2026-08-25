@@ -44,7 +44,7 @@ impl TransferDecision {
 }
 
 /*
- * Complete frame payload:
+ * COMPLETE frame payload:
  *
  * [ transfer_id: 16 bytes ]
  * [ blake3_hash: 32 bytes ]
@@ -79,27 +79,38 @@ pub fn parse_complete_frame(frame: &Frame) -> Result<([u8; 16], [u8; 32]), &'sta
 }
 
 /*
- * Verified frame payload:
+ * VERIFIED frame payload:
  *
  * [ transfer_id: 16 bytes ]
+ * [ blake3_hash: 32 bytes ]
+ *
+ * Total: 48 bytes
  */
-pub fn verified_frame(transfer_id: [u8; 16]) -> Result<Frame, &'static str> {
-    Frame::new(FrameType::Verified, transfer_id.to_vec())
+pub fn verified_frame(transfer_id: [u8; 16], hash: [u8; 32]) -> Result<Frame, &'static str> {
+    let mut payload = Vec::with_capacity(48);
+
+    payload.extend_from_slice(&transfer_id);
+    payload.extend_from_slice(&hash);
+
+    Frame::new(FrameType::Verified, payload)
 }
 
-pub fn parse_verified_frame(frame: &Frame) -> Result<[u8; 16], &'static str> {
+pub fn parse_verified_frame(frame: &Frame) -> Result<([u8; 16], [u8; 32]), &'static str> {
     if frame.frame_type != FrameType::Verified {
         return Err("frame is not a verified frame");
     }
 
-    if frame.payload.len() != 16 {
+    if frame.payload.len() != 48 {
         return Err("invalid verified frame payload length");
     }
 
     let mut transfer_id = [0u8; 16];
-    transfer_id.copy_from_slice(&frame.payload);
+    let mut hash = [0u8; 32];
 
-    Ok(transfer_id)
+    transfer_id.copy_from_slice(&frame.payload[..16]);
+    hash.copy_from_slice(&frame.payload[16..48]);
+
+    Ok((transfer_id, hash))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,12 +253,17 @@ mod tests {
     #[test]
     fn verified_frame_roundtrip() {
         let transfer_id = [8u8; 16];
+        let hash = [42u8; 32];
 
-        let frame = verified_frame(transfer_id).unwrap();
+        let frame = verified_frame(transfer_id, hash).unwrap();
 
-        let decoded_id = parse_verified_frame(&frame).unwrap();
+        assert_eq!(frame.frame_type, FrameType::Verified);
+        assert_eq!(frame.payload.len(), 48);
+
+        let (decoded_id, decoded_hash) = parse_verified_frame(&frame).unwrap();
 
         assert_eq!(decoded_id, transfer_id);
+        assert_eq!(decoded_hash, hash);
     }
 
     #[test]
@@ -259,7 +275,7 @@ mod tests {
 
     #[test]
     fn invalid_verified_length_is_rejected() {
-        let frame = Frame::new(FrameType::Verified, vec![0u8; 15]).unwrap();
+        let frame = Frame::new(FrameType::Verified, vec![0u8; 47]).unwrap();
 
         assert!(parse_verified_frame(&frame).is_err());
     }

@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 
 use zstd::stream::{decode_all, encode_all};
 

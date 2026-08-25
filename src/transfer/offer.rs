@@ -1,4 +1,4 @@
-use std::io::{self, Cursor, Read};
+use std::io::{Cursor, Read};
 
 use crate::transport::protocol::{Frame, FrameType, MAX_FILE_NAME_LEN, MAX_MIME_TYPE_LEN};
 

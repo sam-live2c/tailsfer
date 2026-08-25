@@ -25,9 +25,7 @@ impl DeviceIdentity {
         }
     }
 
-    pub fn load_or_create<P: AsRef<Path>>(
-        path: P,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load_or_create<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let path = path.as_ref();
 
         if path.exists() {
@@ -40,19 +38,14 @@ impl DeviceIdentity {
         Ok(identity)
     }
 
-    pub fn save<P: AsRef<Path>>(
-        &self,
-        path: P,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
         let path = path.as_ref();
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let mut data = Vec::with_capacity(
-            DEVICE_ID_SIZE + DEVICE_KEY_SIZE
-        );
+        let mut data = Vec::with_capacity(DEVICE_ID_SIZE + DEVICE_KEY_SIZE);
 
         data.extend_from_slice(&self.device_id);
         data.extend_from_slice(&self.private_key);
@@ -62,9 +55,7 @@ impl DeviceIdentity {
         Ok(())
     }
 
-    pub fn load<P: AsRef<Path>>(
-        path: P,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let data = fs::read(path)?;
 
         if data.len() != DEVICE_ID_SIZE + DEVICE_KEY_SIZE {
@@ -76,9 +67,7 @@ impl DeviceIdentity {
 
         device_id.copy_from_slice(&data[..DEVICE_ID_SIZE]);
 
-        private_key.copy_from_slice(
-            &data[DEVICE_ID_SIZE..]
-        );
+        private_key.copy_from_slice(&data[DEVICE_ID_SIZE..]);
 
         Ok(Self {
             device_id,
@@ -95,10 +84,7 @@ impl DeviceIdentity {
 }
 
 pub fn default_identity_path() -> PathBuf {
-    let home = std::env::var("HOME")
-        .unwrap_or_else(|_| ".".to_string());
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
 
-    PathBuf::from(home)
-        .join(".tailsfer")
-        .join("identity")
+    PathBuf::from(home).join(".tailsfer").join("identity")
 }

@@ -32,9 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut registry = cleanup_registry.write().await;
 
-            registry.retain(|_, registration| {
-                registration.last_seen.elapsed() < REGISTRATION_TTL
-            });
+            registry.retain(|_, registration| registration.last_seen.elapsed() < REGISTRATION_TTL);
         }
     });
 
@@ -120,13 +118,9 @@ async fn handle_connection(
                 let registry = registry.read().await;
 
                 match registry.get(device_id) {
-                    Some(registration)
-                        if registration.last_seen.elapsed() < REGISTRATION_TTL =>
-                    {
+                    Some(registration) if registration.last_seen.elapsed() < REGISTRATION_TTL => {
                         writer
-                            .write_all(
-                                format!("FOUND {}\n", registration.endpoint).as_bytes(),
-                            )
+                            .write_all(format!("FOUND {}\n", registration.endpoint).as_bytes())
                             .await?;
                     }
 
@@ -150,6 +144,5 @@ async fn handle_connection(
 }
 
 fn valid_device_id(device_id: &str) -> bool {
-    device_id.len() == DEVICE_ID_HEX_LEN
-        && device_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    device_id.len() == DEVICE_ID_HEX_LEN && device_id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

@@ -12,7 +12,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 use tailsfer_core::transfer::decision::{TransferDecision, parse_verified_frame};
 use tailsfer_core::transfer::offer::TransferOffer;
@@ -104,7 +104,6 @@ fn generate_transfer_id() -> [u8; 16] {
     let mut id = [0u8; 16];
 
     id[..8].copy_from_slice(&(now as u64).to_le_bytes());
-
     id[8..].copy_from_slice(&((now >> 64) as u64).to_le_bytes());
 
     id
@@ -235,18 +234,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut file = File::open(path).await?;
-
     let mut buffer = vec![0u8; CHUNK_SIZE];
 
     let mut total = 0u64;
-
-    /*
-     * Calculate the sender-side BLAKE3 digest while transmitting.
-     *
-     * The current VERIFIED frame contains only the transfer ID,
-     * so this hash is recorded locally for the next protocol
-     * stage where the receiver's hash can be compared.
-     */
     let mut hasher = blake3::Hasher::new();
 
     loop {
@@ -262,11 +252,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         total += n as u64;
 
-        println!(
-            "Sent: {:.2} MiB / {:.2} MiB",
-            total as f64 / 1_048_576.0,
-            offer.file_size as f64 / 1_048_576.0
-        );
     }
 
     if total != offer.file_size {
@@ -279,9 +264,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let local_hash = *hasher.finalize().as_bytes();
 
-    /*
-     * FIN tells the receiver that all file bytes have been sent.
-     */
     send.finish()?;
 
     println!();
@@ -289,19 +271,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Sender BLAKE3: {}", hash_hex(&local_hash));
     println!("Waiting for receiver verification...");
 
-    /*
-     * The receiver must now send a dedicated VERIFIED frame.
-     */
     match read_frame(&mut recv).await {
         Ok(frame) => match frame.frame_type {
             FrameType::Verified => {
-                let verified_id = parse_verified_frame(&frame)?;
+                let (verified_id, receiver_hash) = parse_verified_frame(&frame)?;
 
                 if verified_id != transfer_id {
                     return Err("receiver verified a different transfer ID".into());
                 }
 
                 println!("Receiver VERIFIED the transfer.");
+                println!("Receiver BLAKE3: {}", hash_hex(&receiver_hash));
+
+                if receiver_hash != local_hash {
+                    return Err(
+                        "BLAKE3 verification failed: sender and receiver hashes differ".into(),
+                    );
+                }
+
+                println!("BLAKE3 hashes MATCH.");
                 println!("Transfer ID confirmed.");
             }
 
@@ -335,6 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Size : {} bytes", total);
     println!("BLAKE3: {}", hash_hex(&local_hash));
     println!("Receiver: VERIFIED");
+    println!("Hash: MATCH");
     println!("======================================");
 
     Ok(())
