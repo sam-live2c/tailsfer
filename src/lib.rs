@@ -1,3 +1,4 @@
+pub mod identity;
 pub mod crypto;
 pub mod transfer;
 pub mod transport;
