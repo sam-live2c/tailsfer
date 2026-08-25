@@ -4,3 +4,10 @@ target/
 *.tar.gz
 .env
 .env.*
+
+# Local Tailsfer transfer/test artifacts
+tailsfer-10gb-source.bin
+tailsfer-1gb-source.bin
+tailsfer-256mb-test.bin
+tailsfer-test.txt
+decision.rs
