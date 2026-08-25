@@ -18,8 +18,10 @@ use tailsfer_core::transfer::offer::TransferOffer;
 use tailsfer_core::transport::protocol::{ALPN, Frame};
 
 const TAILSFER_PORT: u16 = 47691;
+
 const BUFFER_SIZE: usize = 1024 * 1024;
 const MAX_FRAME_SIZE: usize = 1024 * 1024 + 4096;
+
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,8 +150,12 @@ async fn receive_file(
 
     let result = timeout(TRANSFER_TIMEOUT, async {
         let mut buffer = vec![0u8; BUFFER_SIZE];
+
         let mut total = 0u64;
+
         let mut hasher = blake3::Hasher::new();
+
+        let mut last_reported_mib = 0u64;
 
         loop {
             match recv.read(&mut buffer).await? {
@@ -166,6 +172,23 @@ async fn receive_file(
                             total, offer.file_size
                         )
                         .into());
+                    }
+
+                    let current_mib = total / 1_048_576;
+
+                    if current_mib >= last_reported_mib + 64 || total == offer.file_size {
+                        println!(
+                            "Received: {:.2} / {:.2} MiB ({:.1}%)",
+                            total as f64 / 1_048_576.0,
+                            offer.file_size as f64 / 1_048_576.0,
+                            if offer.file_size == 0 {
+                                100.0
+                            } else {
+                                total as f64 / offer.file_size as f64 * 100.0
+                            }
+                        );
+
+                        last_reported_mib = current_mib;
                     }
                 }
 
@@ -304,14 +327,6 @@ async fn handle_connection(
 
     match result {
         Ok((total, hash)) => {
-            /*
-             * VERIFIED now contains:
-             *
-             * transfer_id + receiver BLAKE3 hash
-             *
-             * The sender can compare this hash with its own
-             * sender-side digest.
-             */
             let verification = verified_frame(offer.transfer_id, hash)?;
 
             let encoded = verification.encode()?;
@@ -322,9 +337,8 @@ async fn handle_connection(
 
             println!();
             println!("Verification sent to sender: {} bytes", total);
-            println!("Receiver BLAKE3: {}", hash_hex(&hash));
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            println!("Receiver BLAKE3: {}", hash_hex(&hash));
 
             connection.close(0u32.into(), b"done");
         }
@@ -337,7 +351,6 @@ async fn handle_connection(
             let encoded = failure.encode()?;
 
             let _ = send.write_all(&encoded).await;
-
             let _ = send.finish();
 
             connection.close(1u32.into(), b"transfer failed");

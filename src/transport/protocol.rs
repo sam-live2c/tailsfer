@@ -113,13 +113,17 @@ impl Frame {
 
 fn read_u8(reader: &mut impl Read) -> io::Result<u8> {
     let mut buffer = [0u8; 1];
+
     reader.read_exact(&mut buffer)?;
+
     Ok(buffer[0])
 }
 
 fn read_u32(reader: &mut impl Read) -> io::Result<u32> {
     let mut buffer = [0u8; 4];
+
     reader.read_exact(&mut buffer)?;
+
     Ok(u32::from_be_bytes(buffer))
 }
 
@@ -131,6 +135,7 @@ mod tests {
     fn frame_types_roundtrip() {
         for value in 1u8..=9 {
             let frame = FrameType::try_from(value).unwrap();
+
             assert_eq!(frame as u8, value);
         }
     }
@@ -163,6 +168,7 @@ mod tests {
         let frame = Frame::new(FrameType::Accept, vec![1, 2, 3]).unwrap();
 
         let mut encoded = frame.encode().unwrap();
+
         encoded.pop();
 
         assert!(Frame::decode(&encoded).is_err());

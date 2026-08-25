@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use quinn::{ClientConfig, Endpoint, RecvStream, SendStream};
-
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -88,7 +87,6 @@ async fn read_frame(recv: &mut RecvStream) -> Result<Frame, Box<dyn std::error::
     recv.read_exact(&mut payload).await?;
 
     let mut frame_bytes = Vec::with_capacity(5 + payload_len);
-
     frame_bytes.extend_from_slice(&header);
     frame_bytes.extend_from_slice(&payload);
 
@@ -150,7 +148,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server: SocketAddr = args[1].parse()?;
     let path = Path::new(&args[2]);
 
+    if !path.exists() {
+        return Err(format!("file does not exist: {}", path.display()).into());
+    }
+
     let metadata = tokio::fs::metadata(path).await?;
+
+    if !metadata.is_file() {
+        return Err(format!("not a regular file: {}", path.display()).into());
+    }
 
     let file_name = path
         .file_name()
@@ -182,6 +188,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     endpoint.set_default_client_config(config);
 
+    println!("Connecting to {server}...");
+
     let connection = endpoint.connect(server, "tailsfer.local")?.await?;
 
     println!("Connected to {server}");
@@ -196,7 +204,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     let offer_frame = offer.to_frame()?;
-
     write_frame(&mut send, &offer_frame).await?;
 
     println!("Waiting for receiver decision...");
@@ -239,6 +246,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut total = 0u64;
     let mut hasher = blake3::Hasher::new();
 
+    let mut last_reported_mib = 0u64;
+
     loop {
         let n = file.read(&mut buffer).await?;
 
@@ -252,6 +261,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         total += n as u64;
 
+        let current_mib = total / 1_048_576;
+
+        if current_mib >= last_reported_mib + 64 || total == offer.file_size {
+            println!(
+                "Sent: {:.2} / {:.2} MiB ({:.1}%)",
+                total as f64 / 1_048_576.0,
+                offer.file_size as f64 / 1_048_576.0,
+                if offer.file_size == 0 {
+                    100.0
+                } else {
+                    total as f64 / offer.file_size as f64 * 100.0
+                }
+            );
+
+            last_reported_mib = current_mib;
+        }
     }
 
     if total != offer.file_size {
@@ -325,6 +350,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Receiver: VERIFIED");
     println!("Hash: MATCH");
     println!("======================================");
+
+    endpoint.wait_idle().await;
 
     Ok(())
 }
