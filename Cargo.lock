@@ -933,6 +933,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tailsfer-api"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "tailsfer-core"
 version = "0.1.0"
 dependencies = [
@@ -946,6 +953,20 @@ dependencies = [
  "tokio",
  "zeroize",
  "zstd",
+]
+
+[[package]]
+name = "tailsfer-relay"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
+name = "tailsfer-rendezvous"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
