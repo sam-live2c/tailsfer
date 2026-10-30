@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod identity;
+pub mod mvp;
 pub mod rendezvous;
 pub mod transfer;
 pub mod transport;
